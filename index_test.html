@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Muon Visualizer — offline (Three.js)</title>
+  <style>
+    body{margin:0;font-family:Inter,Arial,Helvetica,sans-serif;height:100vh;display:flex;}
+    #ui{width:320px;padding:12px;background:#0f172a;color:#e6eef8;box-sizing:border-box;overflow:auto}
+    #canvas-wrap{flex:1;position:relative}
+    canvas{display:block}
+    label{display:block;margin-top:8px;font-size:13px}
+    input[type=file]{width:100%}
+    button{margin-top:8px;padding:8px 10px;border-radius:6px;border:0;background:#2563eb;color:white;cursor:pointer}
+    .hint{font-size:12px;opacity:0.8}
+    .row{display:flex;gap:8px}
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <h3>Muon Visualizer (Three.js)</h3>
+    <div class="hint">Офлайн. Загрузите: Detectors.txt и Tracks_DistrOutput_*.csv (или corrected csv). Можно также загрузить glTF/OBJ модель.</div>
+
+    <label>Detectors.txt (формат: id x y z)</label>
+    <input id="det-file" type="file" accept=".txt" />
+
+    <label>Tracks CSV (Tetta,Phi,Count[,corr,Count_corr])</label>
+    <input id="tracks-file" type="file" accept=".txt,.csv" />
+
+    <label>3D model (glTF / GLB / OBJ) — необязательно</label>
+    <input id="model-file" type="file" accept=".gltf,.glb,.obj" />
+
+    <label>Параметры отображения</label>
+    <div class="row">
+      <button id="load-sample">Загрузить пример</button>
+      <button id="clear-scene">Очистить</button>
+    </div>
+
+    <label>Настройки визуализации</label>
+    <div>
+      <label>Макс лучей: <input id="max-rays" type="number" value="500" min="10" max="5000" style="width:80px"/></label>
+      <label>Масштаб длины: <input id="len-scale" type="number" value="5" step="0.5" style="width:80px"/></label>
+      <label>Использовать лог-шкалу цвета: <input id="log-color" type="checkbox"/></label>
+      <label>Порог Count (мин): <input id="min-count" type="number" value="1" style="width:80px"/></label>
+    </div>
+
+    <button id="draw-btn">Отобразить</button>
+
+    <hr/>
+    <div class="hint">Инструкции по упаковке:</div>
+    <ol>
+      <li>Для Electron — положите этот файл в папку проекта и используйте simple-browser-window. Для Tauri — положите в src-tauri/www.</li>
+      <li>Приложение работает офлайн — все файлы загружаются через диалог <em>file</em>.</li>
+    </ol>
+
+    <div style="height:30px"></div>
+  </div>
+
+  <div id="canvas-wrap"></div>
+
+  <!-- Three.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.159.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.159.0/examples/js/controls/OrbitControls.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.159.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.159.0/examples/js/loaders/OBJLoader.js"></script>
+
+  <script>
+  // Простая локальная 3D визуализация направлений мюонов
+  // Поддерживает отображение точек детекторов и линий (лучей) по углам Tetta (зенит) и Phi (азимут)
+
+  let scene, camera, renderer, controls;
+  const wrap = document.getElementById('canvas-wrap');
+  init();
+
+  let detectors = []; // {id,x,y,z}
+  let tracks = [];    // {Tetta,Phi,Count,corr?,Count_corr?}
+  let modelMesh = null;
+
+  function init(){
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1220);
+
+    const w = wrap.clientWidth || window.innerWidth - 320;
+    const h = window.innerHeight;
+    camera = new THREE.PerspectiveCamera(60, w/h, 0.1, 10000);
+    camera.position.set(0, -200, 200);
+
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setSize(w,h);
+    wrap.appendChild(renderer.domElement);
+
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(0,0,50);
+    controls.update();
+
+    // lights
+    const amb = new THREE.AmbientLight(0xffffff, 0.4); scene.add(amb);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.7); dir.position.set(100,100,200); scene.add(dir);
+
+    window.addEventListener('resize', onResize);
+    animate();
+  }
+  function onResize(){
+    const w = wrap.clientWidth || window.innerWidth - 320;
+    const h = window.innerHeight;
+    camera.aspect = w/h; camera.updateProjectionMatrix();
+    renderer.setSize(w,h);
+  }
+
+  function animate(){
+    requestAnimationFrame(animate);
+    renderer.render(scene,camera);
+  }
+
+  // --- Parsing helpers ---
+  function parseDetectorsTxt(text){
+    const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l && !l.startsWith('#'));
+    const out = [];
+    for(const ln of lines){
+      const parts = ln.split(/\s+/);
+      if(parts.length >= 4){
+        const id = parts[0];
+        const x = parseFloat(parts[1]);
+        const y = parseFloat(parts[2]);
+        const z = parseFloat(parts[3]);
+        if(!isNaN(x) && !isNaN(y) && !isNaN(z)) out.push({id,x,y,z});
+      }
+    }
+    return out;
+  }
+
+  function parseTracksCsv(text){
+    // ожидание: Tetta Phi Count [corr Count_corr]
+    const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l && !l.startsWith('#'));
+    const out = [];
+    for(const ln of lines){
+      const p = ln.split(/\s*,?\s+|,|;/).filter(s=>s!=='');
+      if(p.length >= 3){
+        const T = parseFloat(p[0]);
+        const P = parseFloat(p[1]);
+        const C = parseFloat(p[2]);
+        const obj = {Tetta:T, Phi:P, Count:C};
+        if(p.length>=4) obj.corr = parseFloat(p[3]);
+        if(p.length>=5) obj.Count_corr = parseFloat(p[4]);
+        out.push(obj);
+      }
+    }
+    return out;
+  }
+
+  // Convert spherical (degrees) to direction vector (Earth coords):
+  // theta = zenith angle (0=up), phi = azimuth from X axis
+  function sphToDir(thetaDeg, phiDeg){
+    const t = THREE.MathUtils.degToRad(thetaDeg);
+    const p = THREE.MathUtils.degToRad(phiDeg);
+    const x = Math.sin(t)*Math.cos(p);
+    const y = Math.sin(t)*Math.sin(p);
+    const z = Math.cos(t);
+    return new THREE.Vector3(x,y,z);
+  }
+
+  function clearScene(){
+    // remove everything except camera & lights
+    for(let i = scene.children.length - 1; i >= 0; i--){
+      const ch = scene.children[i];
+      if(ch.type === 'Scene') continue;
+      if(ch === camera) continue;
+      if(ch.isLight) continue;
+      if(ch === modelMesh) continue;
+      scene.remove(ch);
+    }
+  }
+
+  function drawDetectors(){
+    const g = new THREE.SphereGeometry(1.8, 12, 12);
+    const mat = new THREE.MeshStandardMaterial({color:0xffb86b, metalness:0.2, roughness:0.6});
+    const labelCanvas = document.createElement('canvas');
+    detectors.forEach(d=>{
+      const m = new THREE.Mesh(g, mat.clone());
+      m.position.set(d.x, d.y, d.z);
+      m.userData = d;
+      scene.add(m);
+
+      // simple label using Sprite
+      const sprite = makeTextSprite('D'+d.id, {fontsize:18, borderColor:{r:0,g:0,b:0,a:1}});
+      sprite.position.set(d.x, d.y, d.z+6);
+      sprite.scale.set(10,4,1);
+      scene.add(sprite);
+    })
+  }
+
+  // create a canvas-based sprite with text
+  function makeTextSprite(message, parameters){
+    if(parameters === undefined) parameters = {};
+    const fontface = parameters.hasOwnProperty('fontface') ? parameters['fontface'] : 'Arial';
+    const fontsize = parameters.hasOwnProperty('fontsize') ? parameters['fontsize'] : 18;
+    const borderThickness = parameters.hasOwnProperty('borderThickness') ? parameters['borderThickness'] : 4;
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    context.font = fontsize + 'px ' + fontface;
+    const metrics = context.measureText(message);
+    const textWidth = metrics.width;
+    canvas.width = textWidth + 20;
+    canvas.height = fontsize + 20;
+    // background
+    context.fillStyle = 'rgba(255,255,255,0.0)';
+    context.fillRect(0,0,canvas.width,canvas.height);
+    // text
+    context.fillStyle = 'white';
+    context.fillText(message, 10, fontsize+4);
+    const texture = new THREE.CanvasTexture(canvas);
+    const spriteMaterial = new THREE.SpriteMaterial({map:texture});
+    const sprite = new THREE.Sprite(spriteMaterial);
+    return sprite;
+  }
+
+  function drawRays(options){
+    // options: maxRays, lenScale, useLog, minCount
+    const sorted = tracks.slice().sort((a,b)=>{
+      const va = (a.Count_corr !== undefined) ? a.Count_corr : a.Count;
+      const vb = (b.Count_corr !== undefined) ? b.Count_corr : b.Count;
+      return vb - va;
+    });
+    const maxRays = options.maxRays || 500;
+    const lenScale = options.lenScale || 5;
+    const useLog = !!options.useLog;
+    const minCount = options.minCount || 1;
+
+    const raysToDraw = sorted.filter(r=>{
+      const v = (r.Count_corr !== undefined)? r.Count_corr : r.Count;
+      return !isNaN(v) && v >= minCount;
+    }).slice(0, maxRays);
+
+    // compute min/max for color scaling
+    let vals = raysToDraw.map(r => (r.Count_corr !== undefined)? r.Count_corr : r.Count);
+    const vmin = Math.min(...vals); const vmax = Math.max(...vals);
+
+    // for each detector, draw rays from its position
+    // if there are multiple detectors, we'll duplicate rays for each detector; user can filter
+    const detector = detectors.length? detectors[0] : {x:0,y:0,z:0};
+
+    raysToDraw.forEach((r, idx)=>{
+      const dir = sphToDir(r.Tetta, r.Phi);
+      const val = (r.Count_corr !== undefined) ? r.Count_corr : r.Count;
+      const norm = (useLog) ? (Math.log10(val+1)-Math.log10(vmin+1)) / (Math.log10(vmax+1)-Math.log10(vmin+1)+1e-9)
+                             : (val - vmin)/(vmax - vmin + 1e-9);
+      const color = new THREE.Color();
+      color.setHSL(0.6 * (1 - norm), 1.0, 0.5);
+
+      const length = lenScale * (1 + norm*5);
+      const start = new THREE.Vector3(detector.x, detector.y, detector.z);
+      const end = start.clone().add(dir.clone().multiplyScalar(length));
+
+      // line
+      const geo = new THREE.BufferGeometry().setFromPoints([start, end]);
+      const mat = new THREE.LineBasicMaterial({color: color, linewidth: 2, transparent:true, opacity: 0.9});
+      const line = new THREE.Line(geo, mat);
+      scene.add(line);
+
+      // cone at end
+      const coneGeom = new THREE.ConeGeometry(0.6 + norm*1.5, 2.5, 8);
+      const coneMat = new THREE.MeshStandardMaterial({color: color});
+      const cone = new THREE.Mesh(coneGeom, coneMat);
+      cone.position.copy(end);
+      // orient cone along dir
+      cone.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+      scene.add(cone);
+    })
+  }
+
+  // --- File inputs handling ---
+  document.getElementById('det-file').addEventListener('change', e=>{
+    const f = e.target.files[0]; if(!f) return;
+    f.text().then(txt=>{
+      detectors = parseDetectorsTxt(txt);
+      console.log('detectors loaded', detectors.length);
+      // quick draw
+      drawPreview();
+    })
+  });
+
+  document.getElementById('tracks-file').addEventListener('change', e=>{
+    const f = e.target.files[0]; if(!f) return;
+    f.text().then(txt=>{
+      tracks = parseTracksCsv(txt);
+      console.log('tracks loaded', tracks.length);
+      drawPreview();
+    })
+  });
+
+  document.getElementById('model-file').addEventListener('change', e=>{
+    const f = e.target.files[0]; if(!f) return;
+    const name = f.name.toLowerCase();
+    const url = URL.createObjectURL(f);
+    if(name.endsWith('.gltf')||name.endsWith('.glb')){
+      const loader = new THREE.GLTFLoader();
+      loader.load(url, gltf=>{
+        if(modelMesh) scene.remove(modelMesh);
+        modelMesh = gltf.scene; scene.add(modelMesh);
+      });
+    } else if(name.endsWith('.obj')){
+      const loader = new THREE.OBJLoader();
+      loader.load(url, obj=>{ if(modelMesh) scene.remove(modelMesh); modelMesh = obj; scene.add(modelMesh); });
+    } else alert('Unsupported model format');
+  });
+
+  document.getElementById('draw-btn').addEventListener('click', ()=>{
+    drawScene();
+  });
+
+  document.getElementById('load-sample').addEventListener('click', ()=>{
+    // Small embedded sample: use detectors from uploaded Detectors.txt if present, else create synthetic
+    if(detectors.length === 0){
+      detectors = [
+        {id:9,x:0,y:0,z:75},
+        {id:1,x:-45.459,y:27.076,z:74.22}
+      ];
+    }
+    if(tracks.length === 0){
+      // create artificial two-lobes sample similar to your data
+      tracks = [];
+      for(let phi=60; phi<=120; phi+=1){ for(let t=60; t<=85; t+=0.5){ tracks.push({Tetta:t,Phi:phi,Count: Math.round(20 + 100*Math.random())}); } }
+      for(let phi=240; phi<=300; phi+=1){ for(let t=60; t<=85; t+=0.5){ tracks.push({Tetta:t,Phi:phi,Count: Math.round(20 + 100*Math.random())}); } }
+    }
+    drawScene();
+  });
+
+  document.getElementById('clear-scene').addEventListener('click', ()=>{
+    // remove objects except lights
+    while(scene.children.length>0){
+      const c = scene.children[0]; if(c.isLight){ scene.remove(c); continue; } scene.remove(c);
+    }
+    // reinit simple scene
+    init(); detectors = []; tracks = []; modelMesh = null;
+  });
+
+  function drawPreview(){
+    // quick preview: clear and draw detectors
+    // remove previous non-light children
+    for(let i = scene.children.length-1;i>=0;i--){ const ch=scene.children[i]; if(ch.isLight) continue; if(ch.type==='Camera') continue; scene.remove(ch);}
+    drawDetectors();
+  }
+
+  function drawScene(){
+    // clear existing rays & labels but keep model & lights
+    for(let i = scene.children.length-1;i>=0;i--){ const ch=scene.children[i]; if(ch.isLight) continue; if(ch === modelMesh) continue; if(ch.type==='Scene') continue; if(ch.type==='Camera') continue; scene.remove(ch); }
+    if(detectors.length>0) drawDetectors();
+
+    const maxRays = parseInt(document.getElementById('max-rays').value,10) || 500;
+    const lenScale = parseFloat(document.getElementById('len-scale').value) || 5;
+    const useLog = document.getElementById('log-color').checked;
+    const minCount = parseFloat(document.getElementById('min-count').value) || 1;
+
+    drawRays({maxRays,lenScale,useLog,minCount});
+  }
+
+  </script>
+</body>
+</html>
